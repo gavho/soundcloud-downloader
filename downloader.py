@@ -1,5 +1,6 @@
 """Local SoundCloud batch downloader. Run: python downloader.py, then use the page it opens."""
 import json
+import re
 import threading
 import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -7,15 +8,35 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 import yt_dlp
+from yt_dlp.extractor.soundcloud import SoundcloudBaseIE
 
 HERE = Path(__file__).parent
 OUT = HERE / "downloads"
 PORT = 8765
 ALLOWED_HOSTS = {"soundcloud.com", "www.soundcloud.com", "m.soundcloud.com", "on.soundcloud.com"}
+GATE_HOSTS = ("hypeddit.com", "toneden.io", "gate.fm", "show.co", "fanlink.to", "dropbox.com",
+              "drive.google.com", "wetransfer.com", "we.tl", "mega.nz", "edmdl.com", "artist.link")
+STORE_HOSTS = ("bandcamp.com", "beatport.com", "traxsource.com", "junodownload.com")
+URL_RE = re.compile(r"https?://[^\s<>\"')\]]+")
 
 tracks = {}  # title -> {"state", "percent"}
+links = []  # one row per scanned track
 errors = []
 lock = threading.Lock()
+
+# shortcut: yt-dlp drops SoundCloud's purchase link and download flag, so copy them from the raw
+# API data via a private method; re-check this if a yt-dlp update breaks link scanning.
+_build_info = SoundcloudBaseIE._extract_info_dict
+
+
+def _keep_link_fields(self, info, *args, **kwargs):
+    out = _build_info(self, info, *args, **kwargs)
+    out["sc_purchase_url"] = info.get("purchase_url")
+    out["sc_downloadable"] = bool(info.get("downloadable"))
+    return out
+
+
+SoundcloudBaseIE._extract_info_dict = _keep_link_fields
 
 
 def valid_urls(text):
@@ -79,6 +100,46 @@ def run(urls):
         ydl.download(urls)
 
 
+def host_in(url, hosts):
+    host = (urlparse(url).hostname or "").removeprefix("www.")
+    return any(host == h or host.endswith("." + h) for h in hosts)
+
+
+def link_row(info):
+    """Pick the best way to get a full-quality file for one track."""
+    found = [info.get("sc_purchase_url")] + URL_RE.findall(info.get("description") or "")
+    found = [u.rstrip(".,!") for u in found if u]
+    gate = next((u for u in found if host_in(u, GATE_HOSTS)), None)
+    store = next((u for u in found if host_in(u, STORE_HOSTS)), None)
+    page = info.get("webpage_url")
+    if gate:
+        kind, url = "gate", gate
+    elif info.get("sc_downloadable"):
+        kind, url = "soundcloud button", page
+    elif (info.get("license") or "").startswith("cc-"):
+        kind, url = "creative commons", page
+    elif store:
+        kind, url = "buy", store
+    elif info.get("sc_purchase_url"):
+        kind, url = "other link", info["sc_purchase_url"]
+    else:
+        kind, url = "stream only", page
+    return {"title": f"{info.get('uploader', '?')} - {info.get('title', '?')}", "kind": kind, "url": url}
+
+
+def scan(urls):
+    with lock:
+        links.clear()
+    opts = {"skip_download": True, "ignoreerrors": True, "logger": ErrorLog()}
+    with yt_dlp.YoutubeDL(opts) as ydl:
+        for url in urls:
+            info = ydl.extract_info(url, download=False)
+            for entry in (info or {}).get("entries") or ([info] if info else []):
+                if entry:
+                    with lock:
+                        links.append(link_row(entry))
+
+
 class Handler(BaseHTTPRequestHandler):
     def send(self, code, body, ctype="application/json"):
         data = body if isinstance(body, bytes) else json.dumps(body).encode()
@@ -93,12 +154,13 @@ class Handler(BaseHTTPRequestHandler):
             self.send(200, (HERE / "index.html").read_bytes(), "text/html; charset=utf-8")
         elif self.path == "/status":
             with lock:
-                self.send(200, {"tracks": tracks, "errors": errors[-20:], "folder": str(OUT)})
+                self.send(200, {"tracks": tracks, "links": links, "errors": errors[-20:], "folder": str(OUT)})
         else:
             self.send(404, {"error": "not found"})
 
     def do_POST(self):
-        if self.path != "/download":
+        jobs = {"/download": run, "/links": scan}
+        if self.path not in jobs:
             return self.send(404, {"error": "not found"})
         try:
             body = json.loads(self.rfile.read(int(self.headers.get("Content-Length", 0))) or b"{}")
@@ -107,7 +169,7 @@ class Handler(BaseHTTPRequestHandler):
         urls = valid_urls(str(body.get("text", "")))
         if not urls:
             return self.send(400, {"error": "No SoundCloud links found. Use full https://soundcloud.com/... links."})
-        threading.Thread(target=run, args=(urls,), daemon=True).start()
+        threading.Thread(target=jobs[self.path], args=(urls,), daemon=True).start()
         self.send(200, {"started": len(urls)})
 
     def log_message(self, *args):
@@ -123,6 +185,16 @@ def self_check():
     assert valid_urls("https://soundcloud.com.evil.com/x") == []
     assert valid_urls("http://soundcloud.com/a/b") == []
     assert valid_urls("hello world\nhttps://soundcloud.com/") == []
+    page = "https://soundcloud.com/a/b"
+    row = lambda **kw: link_row({"webpage_url": page, **kw})["kind"]
+    assert row(description="FREE DL: https://hypeddit.com/abc.") == "gate"
+    assert link_row({"description": "get it https://hypeddit.com/abc."})["url"] == "https://hypeddit.com/abc"
+    assert row(sc_purchase_url="https://www.toneden.io/x/post/y") == "gate"
+    assert row(sc_downloadable=True) == "soundcloud button"
+    assert row(license="cc-by") == "creative commons"
+    assert row(sc_purchase_url="https://artist.bandcamp.com/track/x") == "buy"
+    assert row(description="follow https://notdropbox.com.evil.io/x") == "stream only"
+    assert row() == "stream only"
 
 
 if __name__ == "__main__":

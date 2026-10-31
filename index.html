@@ -14,24 +14,64 @@
   ul { list-style: none; padding: 0; }
   li { padding: 6px 0; border-bottom: 1px solid var(--line); display: flex; justify-content: space-between; gap: 12px; }
   .err { color: var(--err); font-size: 13px; }
+  button.alt { background: transparent; color: var(--fg); border: 1px solid var(--line); }
+  button:disabled { opacity: .5; cursor: default; }
+  .linkrow a { color: var(--accent); word-break: break-all; }
+  .linkrow.opened { opacity: .5; }
+  .tag { font-size: 12px; padding: 1px 6px; border: 1px solid var(--line); border-radius: 10px; white-space: nowrap; }
 </style>
 </head>
 <body>
 <h1>SoundCloud Batch Download</h1>
 <p class="note">Paste track, playlist/set or artist links, one per line. Only download tracks the artist offers as free downloads or under Creative Commons.</p>
-<label for="links">Links</label>
-<textarea id="links" placeholder="https://soundcloud.com/artist/track&#10;https://soundcloud.com/artist/sets/playlist"></textarea>
+<label for="input">Links</label>
+<textarea id="input"placeholder="https://soundcloud.com/artist/track&#10;https://soundcloud.com/artist/sets/playlist"></textarea>
 <button id="go">Download</button>
+<button id="find" class="alt">Find download links</button>
 <p id="msg" class="muted" role="status"></p>
+<section id="linkbox" hidden>
+  <h2>Full-quality download links</h2>
+  <p class="note">"gate" links (Hypeddit, ToneDen, Dropbox...) usually have the 320 kbps or WAV file. Open each one, complete the gate yourself, and save into the downloads folder.</p>
+  <button id="next">Open next gate link</button>
+  <ul id="links"></ul>
+</section>
 <ul id="list"></ul>
 <div id="errors"></div>
 <script>
 const $ = id => document.getElementById(id);
-$("go").onclick = async () => {
-  const r = await fetch("/download", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ text: $("links").value }) });
+const opened = new Set();
+let rows = [];
+async function start(path) {
+  const r = await fetch(path, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ text: $("input").value }) });
   const j = await r.json();
   $("msg").textContent = j.error || `Started ${j.started} link(s).`;
+}
+$("go").onclick = () => start("/download");
+$("find").onclick = () => { opened.clear(); $("linkbox").hidden = false; start("/links"); };
+const safe = u => /^https?:\/\//i.test(u || "");
+function openLink(u) { opened.add(u); window.open(u, "_blank", "noopener"); render(); }
+$("next").onclick = () => {
+  const r = rows.find(r => r.kind === "gate" && safe(r.url) && !opened.has(r.url));
+  if (r) openLink(r.url);
 };
+function render() {
+  $("links").replaceChildren(...rows.map(r => {
+    const li = document.createElement("li");
+    li.className = "linkrow" + (opened.has(r.url) ? " opened" : "");
+    const left = document.createElement("div");
+    left.append(r.title, document.createElement("br"));
+    if (safe(r.url)) {
+      const a = Object.assign(document.createElement("a"), { href: r.url, textContent: r.url, target: "_blank", rel: "noopener" });
+      a.onclick = e => { e.preventDefault(); openLink(r.url); };
+      left.append(a);
+    }
+    li.append(left, Object.assign(document.createElement("span"), { className: "tag", textContent: r.kind }));
+    return li;
+  }));
+  const left = rows.filter(r => r.kind === "gate" && safe(r.url) && !opened.has(r.url)).length;
+  $("next").disabled = !left;
+  $("next").textContent = left ? `Open next gate link (${left} left)` : "No gate links left";
+}
 async function poll() {
   try {
     const j = await (await fetch("/status")).json();
@@ -40,6 +80,7 @@ async function poll() {
       li.append(title, Object.assign(document.createElement("span"), { className: "muted", textContent: t.state === "downloading" ? `${t.percent}%` : t.state }));
       return li;
     }));
+    if (JSON.stringify(j.links) !== JSON.stringify(rows)) { rows = j.links; render(); }
     $("errors").replaceChildren(...j.errors.map(e => Object.assign(document.createElement("p"), { className: "err", textContent: e })));
     if (Object.keys(j.tracks).length) $("msg").textContent = `Saving to ${j.folder}`;
   } catch {}
