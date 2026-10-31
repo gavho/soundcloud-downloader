@@ -1,0 +1,51 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SoundCloud Batch Download</title>
+<style>
+  :root { --bg: #fff; --fg: #1a1a1a; --muted: #666; --line: #ddd; --accent: #f50; --err: #c00; }
+  @media (prefers-color-scheme: dark) { :root { --bg: #161616; --fg: #eee; --muted: #999; --line: #333; --err: #f66; } }
+  body { background: var(--bg); color: var(--fg); font: 15px/1.5 system-ui, sans-serif; max-width: 720px; margin: 0 auto; padding: 24px 16px; }
+  textarea { width: 100%; box-sizing: border-box; height: 160px; font: 13px monospace; padding: 8px; background: var(--bg); color: var(--fg); border: 1px solid var(--line); border-radius: 6px; }
+  button { margin-top: 8px; padding: 8px 18px; background: var(--accent); color: #fff; border: 0; border-radius: 6px; font-weight: 600; cursor: pointer; }
+  .note, .muted { color: var(--muted); font-size: 13px; }
+  ul { list-style: none; padding: 0; }
+  li { padding: 6px 0; border-bottom: 1px solid var(--line); display: flex; justify-content: space-between; gap: 12px; }
+  .err { color: var(--err); font-size: 13px; }
+</style>
+</head>
+<body>
+<h1>SoundCloud Batch Download</h1>
+<p class="note">Paste track, playlist/set or artist links, one per line. Only download tracks the artist offers as free downloads or under Creative Commons.</p>
+<label for="links">Links</label>
+<textarea id="links" placeholder="https://soundcloud.com/artist/track&#10;https://soundcloud.com/artist/sets/playlist"></textarea>
+<button id="go">Download</button>
+<p id="msg" class="muted" role="status"></p>
+<ul id="list"></ul>
+<div id="errors"></div>
+<script>
+const $ = id => document.getElementById(id);
+$("go").onclick = async () => {
+  const r = await fetch("/download", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ text: $("links").value }) });
+  const j = await r.json();
+  $("msg").textContent = j.error || `Started ${j.started} link(s).`;
+};
+async function poll() {
+  try {
+    const j = await (await fetch("/status")).json();
+    $("list").replaceChildren(...Object.entries(j.tracks).map(([title, t]) => {
+      const li = document.createElement("li");
+      li.append(title, Object.assign(document.createElement("span"), { className: "muted", textContent: t.state === "downloading" ? `${t.percent}%` : t.state }));
+      return li;
+    }));
+    $("errors").replaceChildren(...j.errors.map(e => Object.assign(document.createElement("p"), { className: "err", textContent: e })));
+    if (Object.keys(j.tracks).length) $("msg").textContent = `Saving to ${j.folder}`;
+  } catch {}
+  setTimeout(poll, 1000);
+}
+poll();
+</script>
+</body>
+</html>
